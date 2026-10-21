@@ -1559,6 +1559,20 @@ impl InterfaceInference {
         arguments: &[AtomView<'_>],
         logical_arguments: bool,
     ) -> InferenceResult<Option<Canonicalized<ExplicitKey<AbstractIndex>>>> {
+        if symbol == CS.d {
+            let representations = CS
+                .invariant_argument_representations(symbol, arguments)
+                .map_err(TensorInferenceError::invalid)?
+                .expect("the d head is an invariant");
+            return Ok(Some(ExplicitKey::from_iter(
+                std::iter::repeat_n(
+                    representations[1].expect("the d adjoint port is typed"),
+                    arguments.len() - 1,
+                ),
+                symbol,
+                Some(vec![arguments[0].to_owned()]),
+            )));
+        }
         let builtin = symbol == *EPSILON_SYMBOL
             || symbol == ETS.metric
             || symbol == ETS.flat
@@ -1570,6 +1584,21 @@ impl InterfaceInference {
             || symbol == CS.f
             || symbol == CS.t;
         if !builtin {
+            if let Some(family) = crate::color::ScopedColorFamily::from_symbol(symbol)
+                .map_err(TensorInferenceError::invalid)?
+            {
+                crate::color::ScopedColorFamily::validate_arguments(symbol, arguments)
+                    .map_err(TensorInferenceError::invalid)?;
+                let symbols = family.scoped_to_native();
+                let adopted = arguments
+                    .iter()
+                    .map(|argument| argument.rename_symbols(&symbols))
+                    .collect::<Vec<_>>();
+                let adopted = adopted.iter().map(Atom::as_view).collect::<Vec<_>>();
+                // Signature validation, including resolved compact channels,
+                // remains owned by the native generator/structure factories.
+                self.builtin_tensor_structure(symbols[&symbol], &adopted, logical_arguments)?;
+            }
             return Ok(None);
         }
 
@@ -2007,12 +2036,20 @@ impl InterfaceInference {
                     }
                     return true;
                 }
+                if let Err(error) = CS.invariant_metadata(function) {
+                    syntax_error = Some(TensorInferenceError::invalid(error));
+                    return false;
+                }
                 // Explicit scalar functions own their metadata, which may itself
                 // contain tensor syntax without exposing any tensor ports.
                 if SPENSO_TAG.is_scalar_metadata(symbol)
                     || symbol == SPENSO_TAG.scalar
                     || symbol == SPENSO_TAG.pure_scalar
                 {
+                    return false;
+                }
+                if let Err(error) = crate::color::ScopedColorFamily::validate_function(function) {
+                    syntax_error = Some(TensorInferenceError::invalid(error));
                     return false;
                 }
                 let arguments = function.iter().collect::<Vec<_>>();
@@ -2366,10 +2403,14 @@ impl InterfaceInference {
         {
             return None;
         }
+        let metadata_arguments = usize::from(symbol == CS.d);
+        if metadata_arguments != 0 {
+            CS.invariant_metadata(function).ok()??;
+        }
         let mut logical = Vec::new();
         let mut explicit_ports = 0;
         let mut function_metadata = false;
-        for argument in function.iter() {
+        for argument in function.iter().skip(metadata_arguments) {
             if let Ok(slot) = self.slots.parse::<LibraryRep, AbstractIndex>(argument) {
                 explicit_ports += 1;
                 let index = Self::partial_index(slot.aind(), policy);
@@ -2422,6 +2463,12 @@ impl InterfaceInference {
         arguments: &[AtomView<'_>],
         structure: &Canonicalized<ExplicitKey<AbstractIndex>>,
     ) -> PartialStructure {
+        let metadata_arguments = structure
+            .canonical()
+            .additional_args
+            .as_ref()
+            .map_or(0, Vec::len);
+        let arguments = &arguments[metadata_arguments..];
         let canonical_ports = arguments
             .iter()
             .enumerate()
