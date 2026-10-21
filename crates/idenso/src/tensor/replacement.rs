@@ -6,7 +6,7 @@ use std::{
 };
 
 use spenso::structure::{
-    partial::PartialStructure,
+    partial::{PartialStructure, PartialStructureExt},
     slot::{ParseableAind, SlotMatcher},
 };
 use symbolica::{
