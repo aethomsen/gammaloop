@@ -8,9 +8,8 @@ use spenso::{
     algebra::ScalarMul,
     network::{library::function_lib::INBUILTS, tags::SPENSO_TAG},
     structure::{
-        TensorStructure,
         abstract_index::AbstractIndex,
-        partial::PartialStructure,
+        partial::{PartialStructure, PartialStructureExt},
         representation::{LibraryRep, Minkowski, RepName},
         slot::IsAbstractSlot,
     },
