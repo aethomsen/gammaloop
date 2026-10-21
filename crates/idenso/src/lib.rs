@@ -698,13 +698,16 @@ impl IndexTooling for AtomView<'_> {
         // The added component normalization admits only intrinsic commuting
         // syntax. Inspect the original input: emitted scalar aliases would hide
         // private function bodies from this conservative eligibility check.
-        let mut allow_component_conjugation = InterfaceInference::normalization_is_intrinsic(*self);
+        let mut allow_component_conjugation = InterfaceInference::normalization_is_intrinsic(*self)
+            && !self
+                .get_all_symbols(true)
+                .iter()
+                .any(|symbol| symbol.has_tag(&spenso::network::tags::SPENSO_TAG.tensor_word));
         if allow_component_conjugation {
             self.visitor(&mut |part| {
                 if let AtomView::Fun(function) = part {
                     let symbol = function.get_symbol();
                     allow_component_conjugation &= !symbol.is_scalar()
-                        && !symbol.has_tag(&spenso::network::tags::SPENSO_TAG.tensor_word)
                         && (!symbol.has_tag(&spenso::network::tags::SPENSO_TAG.broadcast)
                             || symbol == INBUILTS.conj);
                 }
