@@ -7,7 +7,7 @@ use std::{
 };
 
 use spenso::{
-    network::tags::SPENSO_TAG,
+    network::{library::function_lib::INBUILTS, tags::SPENSO_TAG},
     shadowing::TensorCollectFilter,
     structure::{TensorStructure, partial::PartialStructure},
 };
@@ -50,13 +50,13 @@ fn selected_closed_payload(
 }
 
 struct ScalarAlgebraInput {
-    variable: Symbol,
+    variable: Option<Symbol>,
     reserved: HashSet<Symbol>,
     aliases: BTreeMap<Atom, Atom>,
 }
 
 impl ScalarAlgebraInput {
-    fn new(source: &SymbolicTensor<PartialStructure>, variable: Symbol) -> Self {
+    fn new(source: &SymbolicTensor<PartialStructure>, variable: Option<Symbol>) -> Self {
         Self {
             variable,
             reserved: source
@@ -69,7 +69,8 @@ impl ScalarAlgebraInput {
     }
 
     fn contains_variable(&self, value: &Atom) -> bool {
-        value.get_all_symbols(true).contains(&self.variable)
+        self.variable
+            .is_some_and(|variable| value.get_all_symbols(true).contains(&variable))
     }
 
     fn contains_word(value: &Atom) -> bool {
@@ -80,11 +81,12 @@ impl ScalarAlgebraInput {
     }
 
     fn reject_packed_variable(&self, value: &Atom) -> Result<()> {
+        let Some(variable) = self.variable else {
+            return Ok(());
+        };
         let hidden = Cell::new(false);
         value.visitor(&mut |node| {
-            if matches!(node, AtomView::Num(_))
-                && node.get_all_symbols(true).contains(&self.variable)
-            {
+            if matches!(node, AtomView::Num(_)) && node.get_all_symbols(true).contains(&variable) {
                 hidden.set(true);
             }
             !hidden.get()
@@ -190,6 +192,9 @@ impl SymbolicTensor<PartialStructure> {
     /// exponents; arbitrary scalar-tagged metadata is not mathematical input.
     /// Open native tensor bases/brackets remain native. Root is prepared once
     /// using its original typed interface, including typed zeros and open ports.
+    /// Explicitly selected unary conjugation arguments are entered only when
+    /// independently closed; open conjugated tensors retain their native roles.
+    /// The general payload mapper's default conjugation opacity is unchanged.
     /// Native words remain under their existing algebra; nonlinear word payloads
     /// are explicitly unsupported.
     ///
@@ -201,13 +206,24 @@ impl SymbolicTensor<PartialStructure> {
     pub fn scalar_algebra_input(
         &self,
         variable: Symbol,
+        select_payload: impl FnMut(ScalarPayloadPosition<'_>) -> bool,
+    ) -> Result<AliasedAtom> {
+        self.prepare_scalar_algebra_input(Some(variable), select_payload)
+    }
+
+    /// Prepare the same scoped algebra without requiring a distinguished variable.
+    /// An absent variable changes only variable-presence checks; aliases still
+    /// reserve every source symbol and use the existing checked restoration.
+    pub(super) fn prepare_scalar_algebra_input(
+        &self,
+        variable: Option<Symbol>,
         mut select_payload: impl FnMut(ScalarPayloadPosition<'_>) -> bool,
     ) -> Result<AliasedAtom> {
         self.ensure_validated()?;
         let mut input = ScalarAlgebraInput::new(self, variable);
         input.reject_packed_variable(self.expression())?;
         let mut failure = None;
-        let prepared = self.map_closed_scalar_payloads(
+        let prepared = self.map_scalar_algebra_payloads(
             |position| selected_closed_payload(position, &mut select_payload, &mut failure),
             |position, value| {
                 input.prepare(
@@ -227,6 +243,9 @@ impl SymbolicTensor<PartialStructure> {
         let prepared = input.prepare(&prepared, false)?;
         let mut result = AliasedAtom::from(prepared.expression().clone());
         for (original, alias) in input.aliases {
+            // Match the complete conjugated alias before ordinary substitution
+            // can normalize a restored tensor inside Symbolica's scalar CONJ.
+            result.register_alias(alias.conj(), INBUILTS.conj(&original));
             result.register_alias(alias, original);
         }
         Ok(result)
@@ -251,11 +270,12 @@ impl SymbolicTensor<PartialStructure> {
     ) -> Result<Self> {
         let restored = input.clone().map_root(|_| expression).into_inner();
         let symbols = restored.get_all_symbols(true);
+        // Each fresh identity retains its original Var key. Composite alias
+        // keys (such as CONJ(alias)) also contain universal structural heads,
+        // which are not temporary identities and may occur in legitimate output.
         if input.get_aliases().keys().any(|alias| {
-            alias
-                .get_all_symbols(true)
-                .iter()
-                .any(|symbol| symbols.contains(symbol))
+            matches!(alias.as_view(), AtomView::Var(variable)
+                if symbols.contains(&variable.get_symbol()))
         }) {
             return Err(TensorInferenceError::invalid(
                 "scalar-algebra restoration left a temporary alias in a numeric coefficient encoding; expose that coefficient through the native coefficient API before restoration",
@@ -263,7 +283,7 @@ impl SymbolicTensor<PartialStructure> {
         }
         let restored = self.with_checked_expression(restored)?;
         let mut failure = None;
-        let normalized = restored.map_closed_scalar_payloads(
+        let normalized = restored.map_scalar_algebra_payloads(
             |position| selected_closed_payload(position, &mut select_payload, &mut failure),
             |_, value| {
                 value.with_checked_expression(
@@ -286,7 +306,10 @@ mod tests {
     use crate::{representations::ColorFundamental, test_support::test_initialize};
     use spenso::{
         algebra::ScalarMul,
-        structure::representation::{Minkowski, RepName},
+        structure::{
+            partial::PartialStructureExt,
+            representation::{Minkowski, RepName},
+        },
     };
     use symbolica::{
         coefficient::Coefficient,
@@ -358,10 +381,8 @@ mod tests {
         assert!(!result.expression().contains_symbol(Symbol::DERIVATIVE));
         let symbols = result.expression().get_all_symbols(true);
         assert!(input.get_aliases().keys().all(|alias| {
-            alias
-                .get_all_symbols(true)
-                .iter()
-                .all(|symbol| !symbols.contains(symbol))
+            !matches!(alias.as_view(), AtomView::Var(variable)
+                if symbols.contains(&variable.get_symbol()))
         }));
         result
     }
@@ -680,6 +701,458 @@ mod tests {
         assert!(
             nonlinear
                 .scalar_algebra_input(variable, |_| true)
+                .unwrap_err()
+                .to_string()
+                .contains("native tensor words")
+        );
+    }
+
+    fn power_position(position: ScalarPayloadPosition<'_>) -> bool {
+        matches!(
+            position,
+            ScalarPayloadPosition::PowerBase { .. } | ScalarPayloadPosition::PowerExponent { .. }
+        )
+    }
+
+    fn checked_sum(values: &[Tensor]) -> Tensor {
+        Tensor::infer(Atom::add_many(values.iter().map(Tensor::expression))).unwrap()
+    }
+
+    #[test]
+    fn default_expansion_preserves_closed_nonselfdual_sum_powers() {
+        let p = pair("default_expand_p", 101);
+        let q = pair("default_expand_q", 103);
+        let sum = checked_sum(&[p.clone(), q.clone()]);
+        let square = checked_sum(&[
+            p.pow(&constant(2)).unwrap(),
+            p.multiply(&q).unwrap().scalar_mul(&Atom::num(2)).unwrap(),
+            q.pow(&constant(2)).unwrap(),
+        ]);
+        let cube = checked_sum(&[
+            p.pow(&constant(3)).unwrap(),
+            p.pow(&constant(2))
+                .unwrap()
+                .multiply(&q)
+                .unwrap()
+                .scalar_mul(&Atom::num(3))
+                .unwrap(),
+            p.multiply(&q.pow(&constant(2)).unwrap())
+                .unwrap()
+                .scalar_mul(&Atom::num(3))
+                .unwrap(),
+            q.pow(&constant(3)).unwrap(),
+        ]);
+        for (order, expected) in [(2, square), (3, cube)] {
+            let source = sum.pow(&constant(order)).unwrap();
+            let before = source.clone();
+            let expanded = source.expanded(None, false).unwrap();
+            assert_equal(&expanded, &expected);
+            assert_eq!(source, before);
+            assert_eq!(expanded.expanded(None, false).unwrap(), expanded);
+        }
+        let difference = checked_sum(&[p.clone(), q.scalar_mul(&Atom::num(-1)).unwrap()]);
+        let source = sum.multiply(&difference).unwrap();
+        let expected = checked_sum(&[
+            p.pow(&constant(2)).unwrap(),
+            q.pow(&constant(2))
+                .unwrap()
+                .scalar_mul(&Atom::num(-1))
+                .unwrap(),
+        ]);
+        assert_equal(&source.expanded(None, false).unwrap(), &expected);
+    }
+
+    #[test]
+    fn default_expansion_preserves_other_representations_complex_weights_and_open_ports() {
+        use crate::representations::SpinFundamental;
+        let p = pair("default_expand_color", 107);
+        let slot = SpinFundamental {}.to_symbolic([Atom::num(2), Atom::num(109)]);
+        let q = Tensor::infer(
+            function!(
+                SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_spin_bar"),
+                spenso::dind!(slot.clone())
+            ) * function!(
+                SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_spin"),
+                slot
+            ),
+        )
+        .unwrap();
+        let weighted = q.scalar_mul(&Atom::i()).unwrap();
+        let source = checked_sum(&[p.clone(), weighted])
+            .pow(&constant(2))
+            .unwrap();
+        let terms = [
+            p.pow(&constant(2)).unwrap(),
+            p.multiply(&q)
+                .unwrap()
+                .scalar_mul(&(Atom::num(2) * Atom::i()))
+                .unwrap(),
+            q.pow(&constant(2))
+                .unwrap()
+                .scalar_mul(&Atom::num(-1))
+                .unwrap(),
+        ];
+        let open = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_spectator"),
+            ColorFundamental {}.to_symbolic([Atom::num(3), Atom::num(113)]),
+            spenso::mink!(4, 127),
+            spenso::mink!(4, 131)
+        ))
+        .unwrap();
+        let source = source.multiply(&open).unwrap();
+        let expected = checked_sum(
+            &terms
+                .iter()
+                .map(|term| term.multiply(&open).unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let expanded = source.expanded(None, false).unwrap();
+        assert_eq!(
+            expanded.structure().logical_slots(),
+            source.structure().logical_slots()
+        );
+        assert_equal(&expanded, &expected);
+        let structure = PartialStructure::from_logical_slots(
+            open.structure().logical_slots().into_iter().rev(),
+        );
+        let zero = Tensor::from_declared_parts(Atom::Zero, structure).unwrap();
+        let expanded = zero.expanded(None, false).unwrap();
+        assert_eq!(expanded.expression(), &Atom::Zero);
+        assert_eq!(expanded.structure(), zero.structure());
+    }
+
+    #[test]
+    fn default_expansion_does_not_enter_function_arguments_or_scalar_metadata() {
+        let p = pair("default_expand_metadata_p", 137);
+        let q = pair("default_expand_metadata_q", 139);
+        let sum = checked_sum(&[p.clone(), q.clone()]);
+        let square = sum.pow(&constant(2)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let head = symbol!("scalar_algebra::default_expand_metadata"; Scalar; norm=move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let metadata = function!(head, p.expression(), square.expression());
+        let source = square.scalar_mul(&metadata).unwrap();
+        let before = calls.load(Ordering::SeqCst);
+        let expanded = source.expanded(None, false).unwrap();
+        assert!(expanded.expression().contains(&metadata));
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        let expected = checked_sum(&[
+            p.pow(&constant(2)).unwrap().scalar_mul(&metadata).unwrap(),
+            p.multiply(&q)
+                .unwrap()
+                .scalar_mul(&(Atom::num(2) * &metadata))
+                .unwrap(),
+            q.pow(&constant(2)).unwrap().scalar_mul(&metadata).unwrap(),
+        ]);
+        assert_eq!(expanded.structure(), expected.structure());
+        // The complete declared Scalar metadata is one exact indeterminate.
+        // Symbolica extracts its coefficient without entering function arguments;
+        // only that metadata-free mathematical tensor is alpha-canonicalized.
+        let canonical_coefficient = |value: &Tensor| {
+            assert_eq!(value.structure(), expanded.structure());
+            assert!(value.expression().contains(&metadata));
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            let rows = value
+                .expression()
+                .coefficient_list::<i32>(std::slice::from_ref(&metadata));
+            assert_eq!(rows.len(), 1);
+            let (key, coefficient) = &rows[0];
+            assert_eq!(key, &metadata);
+            assert!(!coefficient.contains(&metadata));
+            let mathematical =
+                Tensor::from_declared_parts(coefficient.clone(), value.structure().clone())
+                    .unwrap();
+            let canonical = mathematical.canonize().unwrap();
+            Tensor::from_declared_parts(
+                canonical.expression().clone(),
+                canonical.structure().clone(),
+            )
+            .unwrap();
+            assert_eq!(canonical.structure(), value.structure());
+            assert!(value.expression().contains(&metadata));
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            canonical
+        };
+        assert!(canonical_coefficient(&expanded).same_value(&canonical_coefficient(&expected)));
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        let opaque = Tensor::infer(function!(
+            symbol!("scalar_algebra::default_expand_arbitrary_function"; Scalar),
+            square.expression()
+        ))
+        .unwrap();
+        assert_eq!(opaque.expanded(None, false).unwrap(), opaque);
+    }
+
+    #[test]
+    fn default_expansion_keeps_native_words_and_nonlinear_word_refusals() {
+        test_initialize();
+        let head = symbol!("scalar_algebra::default_expand_exterior"; Flat, Linear, Antisymmetric; tag=&SPENSO_TAG.tensor_word);
+        let a = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_ghost_a")
+        ))
+        .unwrap();
+        let b = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_ghost_b")
+        ))
+        .unwrap();
+        let word = Tensor::word(head, &[a.clone(), b.clone()]).unwrap();
+        let x = Atom::var(symbol!("scalar_algebra::default_expand_x"));
+        let y = Atom::var(symbol!("scalar_algebra::default_expand_y"));
+        let coefficient = (&x + &y).pow(2);
+        let source = word.scalar_mul(&coefficient).unwrap();
+        let expected = checked_sum(&[
+            word.scalar_mul(&x.pow(2)).unwrap(),
+            word.scalar_mul(&(Atom::num(2) * &x * &y)).unwrap(),
+            word.scalar_mul(&y.pow(2)).unwrap(),
+        ]);
+        let expanded = source.expanded(None, false).unwrap();
+        assert_eq!(expanded.expression(), expected.expression());
+        assert_eq!(expanded.structure(), expected.structure());
+        assert_eq!(word.expanded(None, false).unwrap(), word);
+        let open_a = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::default_expand_open_ghost"),
+            spenso::mink!(4, 149)
+        ))
+        .unwrap();
+        let open_word = Tensor::word(head, &[open_a, b]).unwrap();
+        let source = open_word.scalar_mul(&coefficient).unwrap();
+        let expanded = source.expanded(None, false).unwrap();
+        let expected = checked_sum(&[
+            open_word.scalar_mul(&x.pow(2)).unwrap(),
+            open_word.scalar_mul(&(Atom::num(2) * &x * &y)).unwrap(),
+            open_word.scalar_mul(&y.pow(2)).unwrap(),
+        ]);
+        assert_eq!(expanded.expression(), expected.expression());
+        assert_eq!(expanded.structure(), source.structure());
+        let nonlinear = word
+            .with_checked_expression(word.expression().cos())
+            .unwrap();
+        assert_eq!(nonlinear.expanded(None, false).unwrap(), nonlinear);
+        assert!(
+            nonlinear
+                .prepare_scalar_algebra_input(None, |_| true)
+                .unwrap_err()
+                .to_string()
+                .contains("native tensor words")
+        );
+    }
+
+    #[test]
+    fn expansion_without_a_variable_retains_registry_and_alias_leak_guards() {
+        let p = pair("default_expand_registry_p", 151);
+        let q = pair("default_expand_registry_q", 157);
+        let source = checked_sum(&[p, q]).pow(&constant(2)).unwrap();
+        let prepare = || {
+            source
+                .prepare_scalar_algebra_input(None, power_position)
+                .unwrap()
+        };
+        let first = prepare();
+        let second = prepare();
+        assert!(!first.get_aliases().is_empty());
+        assert!(
+            first
+                .get_aliases()
+                .keys()
+                .all(|alias| !second.get_aliases().contains_key(alias))
+        );
+        let original_symbols = source.expression().get_all_symbols(true);
+        let alias_symbols = first
+            .get_aliases()
+            .keys()
+            .flat_map(|alias| alias.get_all_symbols(true))
+            .collect::<HashSet<_>>();
+        assert!(
+            first.get_root().get_all_symbols(true).iter().all(|symbol| {
+                original_symbols.contains(symbol) || alias_symbols.contains(symbol)
+            })
+        );
+        let result = source
+            .with_scalar_algebra_result(&first, first.get_root().expand(), power_position)
+            .unwrap();
+        assert!(
+            result
+                .expression()
+                .get_all_symbols(true)
+                .iter()
+                .all(|symbol| !alias_symbols.contains(symbol))
+        );
+        let alias = first.get_aliases().keys().next().unwrap();
+        assert!(
+            source
+                .with_scalar_algebra_result(&first, pack(alias), power_position)
+                .unwrap_err()
+                .to_string()
+                .contains("temporary alias")
+        );
+    }
+
+    #[test]
+    fn default_expansion_retains_independent_additive_dummy_scopes() {
+        let p = pair("default_expand_shared_label_p", 163);
+        let q = pair("default_expand_shared_label_q", 163);
+        let source = checked_sum(&[p.clone(), q.clone()])
+            .pow(&constant(2))
+            .unwrap();
+        // The input retains the same written dummy in each additive branch.
+        // Its analytic expected product is constructed with explicit independent
+        // native scopes; ordinary explicit operands do not silently freshen.
+        assert!(matches!(
+            p.multiply(&q),
+            Err(
+                super::super::composition::TensorCompositionError::InvalidExplicitMultiplicity { .. }
+            )
+        ));
+        let expected_p = p
+            .wrap_indices(symbol!("scalar_algebra::expected_p_scope"), true)
+            .unwrap();
+        let expected_q = q
+            .wrap_indices(symbol!("scalar_algebra::expected_q_scope"), true)
+            .unwrap();
+        let expected = checked_sum(&[
+            expected_p.pow(&constant(2)).unwrap(),
+            expected_p
+                .multiply(&expected_q)
+                .unwrap()
+                .scalar_mul(&Atom::num(2))
+                .unwrap(),
+            expected_q.pow(&constant(2)).unwrap(),
+        ]);
+        assert_equal(&source.expanded(None, false).unwrap(), &expected);
+    }
+
+    fn closed_conjugation_position(position: ScalarPayloadPosition<'_>) -> bool {
+        mathematical_position(position)
+            || matches!(position,
+            ScalarPayloadPosition::FunctionArgument { function, argument: 0 }
+                if [Symbol::CONJ, spenso::network::library::function_lib::INBUILTS.conj]
+                    .contains(&function.get_symbol()))
+    }
+
+    #[test]
+    fn closed_conjugation_series_preserves_complex_coefficients_duality_and_powers() {
+        use spenso::{bracket, network::library::function_lib::INBUILTS};
+        let p = pair("closed_conjugation_complex", 1093);
+        let variable = symbol!("scalar_algebra::closed_conjugation_t"; Scalar, Real, Positive);
+        let complex = Atom::var(symbol!("scalar_algebra::closed_conjugation_z"; Scalar));
+        let marked = &complex * p.expression() * Atom::var(variable).pow(2);
+        let source = Tensor::infer(INBUILTS.conj(bracket!(marked)))
+            .unwrap()
+            .pow(&constant(2))
+            .unwrap();
+        let expected = Tensor::infer(INBUILTS.conj(bracket!(p.expression())))
+            .unwrap()
+            .pow(&constant(2))
+            .unwrap()
+            .scalar_mul(&complex.conj().pow(2))
+            .unwrap();
+        let input = source
+            .scalar_algebra_input(variable, closed_conjugation_position)
+            .unwrap();
+        let series = input
+            .get_root()
+            .series(variable, 0, SeriesDepth::absolute(4))
+            .unwrap();
+        assert!(series.coefficient(0.into()).unwrap().is_zero());
+        let restored = source
+            .with_scalar_algebra_result(
+                &input,
+                series.coefficient(4.into()).unwrap(),
+                closed_conjugation_position,
+            )
+            .unwrap();
+        assert_equal(&restored, &expected);
+        assert_eq!(
+            Tensor::infer(restored.expression().clone())
+                .unwrap()
+                .structure(),
+            restored.structure()
+        );
+        assert!(!restored.expression().contains_symbol(variable));
+        // A genuine complex coefficient retains its universal scalar CONJ.
+        assert!(restored.expression().contains_symbol(Symbol::CONJ));
+        let private_alias = input
+            .get_aliases()
+            .keys()
+            .find(|alias| matches!(alias.as_view(), AtomView::Var(_)))
+            .unwrap();
+        assert!(
+            source
+                .with_scalar_algebra_result(
+                    &input,
+                    pack(private_alias),
+                    closed_conjugation_position
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("temporary alias")
+        );
+        let symbols = restored.expression().get_all_symbols(true);
+        assert!(input.get_aliases().keys().all(|alias| {
+            !matches!(alias.as_view(), AtomView::Var(variable)
+                if symbols.contains(&variable.get_symbol()))
+        }));
+    }
+
+    #[test]
+    fn closed_conjugation_series_retains_open_spectators_and_word_refusals() {
+        use spenso::{bracket, network::library::function_lib::INBUILTS};
+        let p = pair("closed_conjugation_open", 1097);
+        let variable = symbol!("scalar_algebra::closed_conjugation_open_t"; Scalar, Real, Positive);
+        let closed =
+            Tensor::infer(INBUILTS.conj(bracket!(p.expression() * Atom::var(variable).pow(2))))
+                .unwrap();
+        let open = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::closed_conjugation_spectator"),
+            ColorFundamental {}.to_symbolic([Atom::num(3), Atom::num(1103)])
+        ))
+        .unwrap();
+        let source = closed.multiply(&open).unwrap();
+        let expected = Tensor::infer(INBUILTS.conj(bracket!(p.expression())))
+            .unwrap()
+            .multiply(&open)
+            .unwrap();
+        let input = source
+            .scalar_algebra_input(variable, closed_conjugation_position)
+            .unwrap();
+        let series = input
+            .get_root()
+            .series(variable, 0, SeriesDepth::absolute(2))
+            .unwrap();
+        let restored = source
+            .with_scalar_algebra_result(
+                &input,
+                series.coefficient(2.into()).unwrap(),
+                closed_conjugation_position,
+            )
+            .unwrap();
+        assert_equal(&restored, &expected);
+        assert_eq!(restored.structure(), source.structure());
+        let zero = source
+            .with_scalar_algebra_result(
+                &input,
+                series.coefficient(1.into()).unwrap(),
+                closed_conjugation_position,
+            )
+            .unwrap();
+        assert!(zero.is_zero());
+        assert_eq!(zero.structure(), source.structure());
+        let word_head = symbol!("scalar_algebra::closed_conjugation_word"; Flat, Linear, Antisymmetric; tag=&SPENSO_TAG.tensor_word);
+        let a = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::closed_conjugation_ghost_a")
+        ))
+        .unwrap();
+        let b = Tensor::infer(function!(
+            SPENSO_TAG.tensor_symbol("scalar_algebra::closed_conjugation_ghost_b")
+        ))
+        .unwrap();
+        let word = Tensor::word(word_head, &[a, b]).unwrap();
+        let nonlinear = Tensor::infer(INBUILTS.conj(word.expression())).unwrap();
+        assert!(
+            nonlinear
+                .scalar_algebra_input(variable, closed_conjugation_position)
                 .unwrap_err()
                 .to_string()
                 .contains("native tensor words")

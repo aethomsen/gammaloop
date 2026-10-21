@@ -566,6 +566,27 @@ impl<Select: FnMut(AtomView<'_>) -> bool> CollectionInput<Select> {
                     if !matches!(opened.graph.graph[opened_root], NetworkNode::Leaf(_)) {
                         let split_root_sum = split_root_sum && node == root
                             && matches!(expression.as_view(), AtomView::Add(_));
+                        if self.mode == CollectionMode::Monomials
+                            && interfaces[&node].canonical().is_scalar()
+                            && opened_tree
+                                .iter_preorder_tree_nodes(&opened.graph.graph, opened_root)
+                                .any(|member| opened.graph.graph.iter_crown(member).any(|hedge| {
+                                    opened.graph.graph[[&hedge]].is_slot()
+                                }))
+                        {
+                            // This retained scalar exposed its internal incidences
+                            // only when opened. Scope the complete closed leaf
+                            // before its factors enter the shared arithmetic tape.
+                            let Some(scoped) = self.expose_scope(&opened, &opened_tree, opened_root)? else {
+                                refused = true;
+                                return Ok(None);
+                            };
+                            let scoped_tree = scoped.graph.expr_tree().cast::<ChildVecStore<()>>();
+                            let scoped_root = scoped.graph.graph.node_id(scoped.graph.head());
+                            let analysis = self.analyze(&scoped, &scoped_tree, scoped_root)?;
+                            return self.compile(tape, &scoped, &scoped_tree, scoped_root, split_root_sum, &analysis)
+                                .map(|compiled| compiled.map(|(node, size)| TermLeaf::Reference(node, size)));
+                        }
                         let analysis = self.analyze(&opened, &opened_tree, opened_root)?;
                         return self.compile(tape, &opened, &opened_tree, opened_root, split_root_sum, &analysis)
                             .map(|compiled| compiled.map(|(node, size)| TermLeaf::Reference(node, size)));
@@ -1214,10 +1235,112 @@ impl SymbolicTensor<PartialStructure> {
 mod tests {
     use super::*;
     use spenso::network::{library::symbolic::ETS, tags::SPENSO_TAG};
+    use spenso::structure::representation::RepName;
     use symbolica::atom::{FunctionBuilder, Symbol};
 
     fn tensor(head: Symbol, slots: &[Atom]) -> Atom {
         FunctionBuilder::new(head).add_args(slots).finish()
+    }
+
+    fn closed_nonselfdual_pair(name: &str, index: usize) -> SymbolicTensor<PartialStructure> {
+        use crate::representations::ColorFundamental;
+        let slot = ColorFundamental {}.to_symbolic([Atom::num(3), Atom::num(index)]);
+        SymbolicTensor::infer(
+            tensor(
+                SPENSO_TAG.tensor_symbol(&format!("collection::{name}_bar")),
+                &[spenso::dind!(slot.clone())],
+            ) * tensor(
+                SPENSO_TAG.tensor_symbol(&format!("collection::{name}")),
+                &[slot],
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn coefficient_list_scopes_newly_opened_closed_sum_products_before_tape() {
+        crate::test_support::test_initialize();
+        let p = closed_nonselfdual_pair("opened_sum_p", 99101);
+        let q = closed_nonselfdual_pair("opened_sum_q", 99103);
+        let source = p
+            .try_add(&q)
+            .unwrap()
+            .multiply(&p.try_sub(&q).unwrap())
+            .unwrap();
+        let before = source.clone();
+        let rows = source
+            .coefficient_list::<0>(TensorCollectFilter::Tensors)
+            .unwrap();
+        assert!(!rows.is_empty());
+        let mut reconstructed = SymbolicTensor::infer(Atom::Zero).unwrap();
+        for (selected, coefficient) in &rows {
+            // A nominal scalar interface cannot certify an illegal power of
+            // individual open non-self-dual tensor components.
+            SymbolicTensor::from_declared_parts(
+                selected.expression.clone(),
+                selected.structure.clone(),
+            )
+            .unwrap();
+            SymbolicTensor::from_declared_parts(
+                coefficient.expression.clone(),
+                coefficient.structure.clone(),
+            )
+            .unwrap();
+            reconstructed = reconstructed
+                .try_add(&selected.multiply(coefficient).unwrap())
+                .unwrap();
+        }
+        let two = SymbolicTensor::infer(Atom::num(2)).unwrap();
+        let expected = p.pow(&two).unwrap().try_sub(&q.pow(&two).unwrap()).unwrap();
+        assert!(
+            reconstructed
+                .canonize()
+                .unwrap()
+                .same_value(&expected.canonize().unwrap())
+        );
+        assert_eq!(source, before);
+    }
+
+    #[test]
+    fn coefficient_list_scopes_independently_bound_additive_closed_branches() {
+        crate::test_support::test_initialize();
+        let p = closed_nonselfdual_pair("additive_bound_p", 99107);
+        let q = closed_nonselfdual_pair("additive_bound_q", 99107);
+        let source = p.try_add(&q).unwrap();
+        assert!(source.is_scalar());
+        // Ordinary explicit operand identities are not silently freshened by
+        // multiplication. The sum's separately bound alternatives are the
+        // independent collector scopes exercised below.
+        assert!(matches!(
+            p.multiply(&q),
+            Err(
+                super::super::composition::TensorCompositionError::InvalidExplicitMultiplicity { .. }
+            )
+        ));
+        let rows = source
+            .coefficient_list::<0>(TensorCollectFilter::Tensors)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (selected, coefficient) in &rows {
+            assert!(selected.is_scalar());
+            assert!(coefficient.expression.is_one());
+            SymbolicTensor::from_declared_parts(
+                selected.expression.clone(),
+                selected.structure.clone(),
+            )
+            .unwrap();
+        }
+        let mixed = rows[0].0.multiply(&rows[1].0).unwrap();
+        let expected = closed_nonselfdual_pair("additive_bound_p", 99109)
+            .multiply(&closed_nonselfdual_pair("additive_bound_q", 99113))
+            .unwrap();
+        assert!(
+            mixed
+                .canonize()
+                .unwrap()
+                .same_value(&expected.canonize().unwrap())
+        );
+        assert_eq!(source, p.try_add(&q).unwrap());
     }
 
     fn contract_selected(

@@ -33,7 +33,7 @@ use symbolica::{
 use thiserror::Error;
 
 use super::{
-    SymbolicTensor,
+    ScalarPayloadPosition, SymbolicTensor,
     composition::{self, ExplicitIndexOccurrences, TensorCompositionError},
     simplification::observation::DomainObservations,
 };
@@ -811,7 +811,19 @@ impl SymbolicTensor<PartialStructure> {
                     self.structure.clone(),
                 ));
             }
-            self.expression.expand()
+            // Closed tensor sectors remain atomic while Symbolica distributes
+            // their scalar algebra. Function arguments and protected brackets
+            // stay opaque, matching the ordinary expansion operation.
+            let select_payload: fn(ScalarPayloadPosition<'_>) -> bool = |position| {
+                matches!(
+                    position,
+                    ScalarPayloadPosition::PowerBase { .. }
+                        | ScalarPayloadPosition::PowerExponent { .. }
+                )
+            };
+            let input = self.prepare_scalar_algebra_input(None, select_payload)?;
+            let expression = input.get_root().expand();
+            return self.with_scalar_algebra_result(&input, expression, select_payload);
         };
         self.with_algebra_result(expression)
     }

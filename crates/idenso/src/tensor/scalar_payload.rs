@@ -3,6 +3,7 @@
 use spenso::{
     network::{library::function_lib::INBUILTS, tags::SPENSO_TAG},
     structure::{
+        TensorStructure,
         abstract_index::AIND_SYMBOLS,
         partial::{PartialStructure, PartialStructureExt},
         slot::{SlotMatch, SlotMatcher},
@@ -63,8 +64,27 @@ impl Tensor {
     /// is not certified to commute or to admit ordinary scalar series.
     pub fn map_closed_scalar_payloads(
         &self,
+        select: impl FnMut(ScalarPayloadPosition<'_>) -> bool,
+        map: impl FnMut(ScalarPayloadPosition<'_>, &Self) -> Result<Self>,
+    ) -> Result<Self> {
+        self.map_closed_scalar_payloads_inner(select, map, false)
+    }
+
+    /// The scalar-algebra protocol may enter explicitly selected, independently
+    /// closed unary conjugations. The public mapper retains its original opacity.
+    pub(super) fn map_scalar_algebra_payloads(
+        &self,
+        select: impl FnMut(ScalarPayloadPosition<'_>) -> bool,
+        map: impl FnMut(ScalarPayloadPosition<'_>, &Self) -> Result<Self>,
+    ) -> Result<Self> {
+        self.map_closed_scalar_payloads_inner(select, map, true)
+    }
+
+    fn map_closed_scalar_payloads_inner(
+        &self,
         mut select: impl FnMut(ScalarPayloadPosition<'_>) -> bool,
         map: impl FnMut(ScalarPayloadPosition<'_>, &Self) -> Result<Self>,
+        closed_conjugation: bool,
     ) -> Result<Self> {
         self.ensure_validated()?;
         let position = ScalarPayloadPosition::Root {
@@ -76,7 +96,11 @@ impl Tensor {
                 "a selected scalar payload must have a closed scalar interface",
             ));
         }
-        let mut mapper = ClosedPayloadMapper { select, map };
+        let mut mapper = ClosedPayloadMapper {
+            select,
+            map,
+            closed_conjugation,
+        };
         let expression = mapper.expression(self.expression().as_view())?;
         let result = if expression == *self.expression() {
             self.clone()
@@ -95,6 +119,7 @@ impl Tensor {
 struct ClosedPayloadMapper<S, M> {
     select: S,
     map: M,
+    closed_conjugation: bool,
 }
 
 impl<S, M> ClosedPayloadMapper<S, M>
@@ -206,6 +231,27 @@ where
                 } else {
                     Ok(original.to_owned())
                 }
+            }
+            AtomView::Fun(function)
+                if self.closed_conjugation
+                    && [Symbol::CONJ, INBUILTS.conj].contains(&function.get_symbol())
+                    && function.get_nargs() == 1 =>
+            {
+                let position = ScalarPayloadPosition::FunctionArgument {
+                    function,
+                    argument: 0,
+                };
+                let argument = function.get(0);
+                if !(self.select)(position)
+                    || !InterfaceInference::replacement_interface(argument)?
+                        .canonical()
+                        .is_scalar()
+                {
+                    return Ok(original.to_owned());
+                }
+                self.function(function, |mapper, _, argument| {
+                    mapper.payload(position, argument)
+                })
             }
             AtomView::Fun(function) if !Self::opaque_function(function) => {
                 self.function(function, |mapper, argument, value| {
@@ -742,5 +788,76 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scalar_algebra_mode_opens_only_selected_closed_unary_conjugations() {
+        test_initialize();
+        let head = tensor_symbol!("closed_payload::conjugation_mode");
+        let closed = bracket!(vector(head, 4811) * vector(head, 4811));
+        let source = expression(function!(INBUILTS.conj, &closed));
+        let mut default_calls = 0;
+        let default = source
+            .map_closed_scalar_payloads(
+                |position| matches!(position, Position::FunctionArgument { .. }),
+                |_, value| {
+                    default_calls += 1;
+                    Ok(value.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(default_calls, 0);
+        assert_eq!(default.expression(), source.expression());
+        let mut calls = 0;
+        let mapped = source
+            .map_scalar_algebra_payloads(
+                |position| {
+                    matches!(position, Position::FunctionArgument { function, argument: 0 }
+                if function.get_symbol() == INBUILTS.conj)
+                },
+                |_, value| {
+                    calls += 1;
+                    assert_eq!(value.expression(), &closed);
+                    Ok(value.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(mapped.expression(), source.expression());
+        assert_eq!(mapped.structure(), source.structure());
+    }
+
+    #[test]
+    fn scalar_algebra_conjugation_mode_keeps_open_and_unselected_operands_opaque() {
+        test_initialize();
+        let head = tensor_symbol!("closed_payload::conjugation_open");
+        let open = expression(function!(INBUILTS.conj, vector(head, 4812)));
+        let mut calls = 0;
+        let mapped = open
+            .map_scalar_algebra_payloads(
+                |position| matches!(position, Position::FunctionArgument { .. }),
+                |_, value| {
+                    calls += 1;
+                    Ok(value.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(mapped.expression(), open.expression());
+        assert_eq!(mapped.structure(), open.structure());
+        let closed = expression(function!(
+            INBUILTS.conj,
+            bracket!(vector(head, 4813) * vector(head, 4813))
+        ));
+        let mapped = closed
+            .map_scalar_algebra_payloads(|_| false, |_, _| panic!("unselected closed conjugation"))
+            .unwrap();
+        assert_eq!(mapped.expression(), closed.expression());
+        for malformed in [
+            function!(INBUILTS.conj),
+            function!(INBUILTS.conj, vector(head, 4814), vector(head, 4815)),
+        ] {
+            assert!(Tensor::infer(malformed).is_err());
+        }
     }
 }
