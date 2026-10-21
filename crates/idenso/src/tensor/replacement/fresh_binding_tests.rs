@@ -319,7 +319,10 @@ fn fresh_binding_checks_complete_labels_representations_and_internal_multiplicit
         leaf("fresh_tensor_rule::wrong_label", &[slot(72)]).expression,
         leaf(
             "fresh_tensor_rule::wrong_dual_rep",
-            &[rep.dual().slot(AbstractIndex::Normal(71)).to_atom()],
+            &[rep
+                .dual()
+                .slot::<AbstractIndex, _>(AbstractIndex::Normal(71))
+                .to_atom()],
         )
         .expression,
         leaf(
