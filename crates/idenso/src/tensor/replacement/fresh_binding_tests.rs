@@ -4,7 +4,7 @@ use spenso::{
     structure::{
         abstract_index::AbstractIndex,
         partial::{PartialIndex, PartialStructureExt},
-        representation::{LibraryRep, Minkowski, RepName},
+        representation::{LibraryRep, Minkowski, RepName, Representation},
         slot::{DummyAind, IsAbstractSlot},
     },
 };
@@ -25,6 +25,20 @@ fn slot(label: usize) -> Atom {
         .new_rep(4)
         .slot::<AbstractIndex, _>(AbstractIndex::Normal(label))
         .to_atom()
+}
+
+fn oriented_slot(rep: Representation<LibraryRep>, label: usize) -> Atom {
+    rep.slot::<AbstractIndex, _>(AbstractIndex::Normal(label))
+        .to_atom()
+}
+
+fn oriented_pair(name: &str, rep: Representation<LibraryRep>, label: usize) -> Tensor {
+    leaf(&format!("{name}_B"), &[oriented_slot(rep, label)])
+        .multiply(&leaf(
+            &format!("{name}_C"),
+            &[oriented_slot(rep.dual(), label)],
+        ))
+        .unwrap()
 }
 
 fn leaf(name: &str, arguments: &[Atom]) -> Tensor {
@@ -323,31 +337,6 @@ fn fresh_binding_checks_complete_labels_representations_and_internal_multiplicit
                 .is_err()
         );
     }
-    // The inherited source proof does not admit ordinary non-self-dual ports.
-    // This explicit refusal is not a successful wrong-variance test or a claim
-    // that fresh-binding application already covers arbitrary representations.
-    let unsupported = leaf(
-        "fresh_tensor_rule::nonselfdual_source",
-        &[rep.slot(AbstractIndex::Normal(71)).to_atom()],
-    );
-    let calls = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::clone(&calls);
-    let rule = TensorRule::new(
-        unsupported.expression.to_pattern(),
-        ReplaceWith::Map(Box::new(move |_| {
-            seen.fetch_add(1, Ordering::Relaxed);
-            Atom::Zero
-        })),
-        None,
-        0,
-    )
-    .unwrap();
-    assert!(
-        unsupported
-            .replace_rules_with_fresh_bindings(&[rule])
-            .is_err()
-    );
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
     let source = leaf("fresh_tensor_rule::bad_pair_F", &[]);
     let j = leaf("fresh_tensor_rule::bad_pair_J", &[slot(75)]);
     let malformed = j.expression.clone().pow(3);
@@ -398,12 +387,22 @@ fn fresh_binding_keeps_scalar_metadata_exact_and_does_not_open_math_powers_or_wo
     );
     let word_head = symbol!("fresh_tensor_rule::opaque_word"; Flat, Linear, Antisymmetric; tag=&SPENSO_TAG.tensor_word);
     let word = Tensor::word(word_head, std::slice::from_ref(&scalar)).unwrap();
-    assert!(word.replace_rules_with_fresh_bindings(&[rule]).is_err());
+    assert!(
+        word.replace_rules_with_fresh_bindings(&[rule])
+            .unwrap()
+            .same_value(&word)
+    );
     let norm = source_leaf.multiply(&source_leaf).unwrap();
     let power = norm.pow(&Tensor::infer(Atom::num(2)).unwrap()).unwrap();
     assert!(
         power
             .replace_rules_with_fresh_bindings(&[literal_rule(&source_leaf, Atom::Zero)])
+            .unwrap()
+            .same_value(&power)
+    );
+    assert!(
+        power
+            .replace(&literal_rule(&source_leaf, Atom::Zero))
             .is_err()
     );
 }
@@ -472,8 +471,10 @@ fn fresh_binding_rechecks_changed_product_powers_without_stamping_rewrite_proofs
     assert!(
         actual
             .replace_rules_with_fresh_bindings(&[literal_rule(&h, Atom::Zero)])
-            .is_err()
+            .unwrap()
+            .same_value(&actual)
     );
+    assert!(actual.replace(&literal_rule(&h, Atom::Zero)).is_err());
 }
 
 #[test]
@@ -550,4 +551,320 @@ fn fresh_binding_reserves_source_and_all_raw_rhs_scope_symbols_at_actual_frontie
     assert_eq!(scopes(&actual).len(), 2);
     let expected = Tensor::infer(&p.expression * &q.expression * &metadata).unwrap();
     assert_eq!(canonical(&actual), canonical(&expected));
+}
+
+#[test]
+fn fresh_binding_admits_both_symbolic_dual_orientations_before_signature_negatives() {
+    initialize();
+    let dimension = symbol!("fresh_tensor_rule::dual_Nf");
+    let rep = LibraryRep::new_dual("fresh_tensor_rule::dual_R")
+        .unwrap()
+        .new_rep(dimension);
+    let other = LibraryRep::new_dual("fresh_tensor_rule::dual_S")
+        .unwrap()
+        .new_rep(dimension);
+    let mut admitted = Vec::new();
+    for (orientation, external) in [("upper", rep), ("lower", rep.dual())] {
+        let source = leaf(
+            &format!("fresh_tensor_rule::dual_{orientation}_V"),
+            &[oriented_slot(external, 201)],
+        );
+        let rhs = leaf(
+            &format!("fresh_tensor_rule::dual_{orientation}_K"),
+            &[oriented_slot(external, 201)],
+        )
+        .multiply(&oriented_pair(
+            &format!("fresh_tensor_rule::dual_{orientation}"),
+            rep,
+            203,
+        ))
+        .unwrap();
+        assert!(source.established_interface_is_valid());
+        assert!(!source.rewrites_preserve_interface());
+        let rule = literal_rule(&source, rhs.expression.clone());
+        assert!(source.replace(&rule).is_err());
+        let actual = source
+            .replace_rules_with_fresh_bindings(std::slice::from_ref(&rule))
+            .unwrap();
+        assert_eq!(
+            actual.structure.logical_slots(),
+            source.structure.logical_slots()
+        );
+        assert_eq!(canonical(&actual), canonical(&rhs));
+        assert_eq!(scopes(&actual).len(), 1);
+        assert!(actual.expression.get_all_symbols(true).contains(&dimension));
+        assert!(!actual.rewrites_preserve_interface());
+        assert!(source.replace(&rule).is_err());
+        admitted.push((source, external));
+    }
+
+    for (source, external) in admitted {
+        // Both real orientations have succeeded before testing variance. Same
+        // rank or symbolic dimension never stands in for full port identity.
+        for wrong_slot in [
+            oriented_slot(external.dual(), 201),
+            oriented_slot(external, 202),
+            oriented_slot(external.rep.new_rep(7), 201),
+            oriented_slot(other, 201),
+        ] {
+            let wrong = leaf("fresh_tensor_rule::dual_wrong", &[wrong_slot]);
+            let error = source
+                .replace_rules_with_fresh_bindings(&[literal_rule(&source, wrong.expression)])
+                .unwrap_err();
+            assert!(error.to_string().contains("external interface"));
+        }
+    }
+}
+
+#[test]
+fn fresh_binding_preserves_symbolic_dual_port_order_under_rhs_permutation() {
+    initialize();
+    let dimension = symbol!("fresh_tensor_rule::dual_order_Nf");
+    let rep = LibraryRep::new_dual("fresh_tensor_rule::dual_order_R")
+        .unwrap()
+        .new_rep(dimension);
+    let source = leaf(
+        "fresh_tensor_rule::dual_order_F",
+        &[oriented_slot(rep, 211), oriented_slot(rep.dual(), 213)],
+    );
+    let rhs = leaf(
+        "fresh_tensor_rule::dual_order_G",
+        &[oriented_slot(rep.dual(), 213), oriented_slot(rep, 211)],
+    )
+    .multiply(&oriented_pair("fresh_tensor_rule::dual_order", rep, 215))
+    .unwrap();
+    assert_ne!(
+        source.structure.logical_slots(),
+        rhs.structure.logical_slots()
+    );
+    let actual = source
+        .replace_rules_with_fresh_bindings(&[literal_rule(&source, rhs.expression.clone())])
+        .unwrap();
+    let expected = Tensor::from_declared_parts(rhs.expression, source.structure.clone()).unwrap();
+    assert_eq!(
+        actual.structure.logical_slots(),
+        source.structure.logical_slots()
+    );
+    assert_eq!(canonical(&actual), canonical(&expected));
+    assert_eq!(scopes(&actual).len(), 1);
+}
+
+#[test]
+fn fresh_binding_separates_dual_internal_pairs_from_bound_occurrence_and_spectator() {
+    initialize();
+    let dimension = symbol!("fresh_tensor_rule::dual_ambient_Nf");
+    let rep = LibraryRep::new_dual("fresh_tensor_rule::dual_ambient_R")
+        .unwrap()
+        .new_rep(dimension);
+    let variable = leaf(
+        "fresh_tensor_rule::dual_ambient_V",
+        &[oriented_slot(rep, 221)],
+    );
+    let partner = leaf(
+        "fresh_tensor_rule::dual_ambient_X",
+        &[oriented_slot(rep.dual(), 221)],
+    );
+    let spectator = leaf(
+        "fresh_tensor_rule::dual_ambient_S",
+        &[oriented_slot(rep, 223)],
+    );
+    let source = variable
+        .multiply(&partner)
+        .unwrap()
+        .multiply(&spectator)
+        .unwrap();
+    let rhs = leaf(
+        "fresh_tensor_rule::dual_ambient_K",
+        &[oriented_slot(rep, 221)],
+    )
+    .multiply(&oriented_pair("fresh_tensor_rule::dual_ambient", rep, 223))
+    .unwrap();
+    let actual = source
+        .replace_rules_with_fresh_bindings(&[literal_rule(&variable, rhs.expression.clone())])
+        .unwrap();
+    let independent = rhs
+        .wrap_indices(symbol!("fresh_tensor_rule::dual_ambient_expected"), true)
+        .unwrap();
+    let expected = independent
+        .multiply(&partner)
+        .unwrap()
+        .multiply(&spectator)
+        .unwrap();
+    assert_eq!(
+        actual.structure.logical_slots(),
+        source.structure.logical_slots()
+    );
+    assert_eq!(
+        actual.structure.logical_slots(),
+        spectator.structure.logical_slots()
+    );
+    assert_eq!(canonical(&actual), canonical(&expected));
+    assert_eq!(scopes(&actual).len(), 1);
+}
+
+#[test]
+fn fresh_binding_dual_zero_and_intrinsic_guards_preserve_abi_without_hook_replay() {
+    initialize();
+    let dimension = symbol!("fresh_tensor_rule::dual_zero_Nf");
+    let rep = LibraryRep::new_dual("fresh_tensor_rule::dual_zero_R")
+        .unwrap()
+        .new_rep(dimension);
+    let source = leaf(
+        "fresh_tensor_rule::dual_zero_F",
+        &[oriented_slot(rep, 231), oriented_slot(rep.dual(), 233)],
+    );
+    let zero = source
+        .replace_rules_with_fresh_bindings(&[literal_rule(&source, Atom::Zero)])
+        .unwrap();
+    assert!(zero.is_zero());
+    assert_eq!(
+        zero.structure.logical_slots(),
+        source.structure.logical_slots()
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let callback = TensorRule::new(
+        source.expression.to_pattern(),
+        ReplaceWith::Map(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Atom::Zero
+        })),
+        None,
+        0,
+    )
+    .unwrap();
+    assert!(
+        zero.replace_rules_with_fresh_bindings(std::slice::from_ref(&callback))
+            .unwrap()
+            .same_value(&zero)
+    );
+    let open = Tensor::from_declared_parts(
+        function!(
+            SPENSO_TAG.tensor_symbol("fresh_tensor_rule::dual_zero_open"),
+            rep.to_symbolic([])
+        ),
+        PartialStructure::from_logical_slots([rep.slot(PartialIndex::open(0))]),
+    )
+    .unwrap();
+    assert!(
+        open.replace_rules_with_fresh_bindings(std::slice::from_ref(&callback))
+            .is_err()
+    );
+    // A raw power of a non-self-dual tensor with free ports is invalid.
+    // The weaker fresh-only guard must not bypass that initial validity check.
+    let vector = leaf(
+        "fresh_tensor_rule::dual_zero_power",
+        &[oriented_slot(rep, 235)],
+    );
+    let malformed = Tensor::new(vector.expression.clone().pow(2), vector.structure.clone());
+    assert!(
+        malformed
+            .replace_rules_with_fresh_bindings(std::slice::from_ref(&callback))
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    static HOOKS: AtomicUsize = AtomicUsize::new(0);
+    let hooked = symbol!(
+        "fresh_tensor_rule::dual_hooked",
+        tag = &SPENSO_TAG.tensor,
+        norm = |_, _| {
+            HOOKS.fetch_add(1, Ordering::Relaxed);
+        }
+    );
+    let rhs = function!(
+        hooked,
+        oriented_slot(rep, 231),
+        oriented_slot(rep.dual(), 233)
+    );
+    let rule = literal_rule(&source, rhs.clone());
+    let before = HOOKS.load(Ordering::Relaxed);
+    assert!(source.replace_rules_with_fresh_bindings(&[rule]).is_err());
+    assert_eq!(HOOKS.load(Ordering::Relaxed), before);
+    let hooked_source = Tensor::infer(rhs).unwrap();
+    let before = HOOKS.load(Ordering::Relaxed);
+    assert!(
+        hooked_source
+            .replace_rules_with_fresh_bindings(&[callback])
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(HOOKS.load(Ordering::Relaxed), before);
+}
+
+#[test]
+fn fresh_binding_checked_source_keeps_composites_opaque_when_siblings_change() {
+    initialize();
+    let dimension = symbol!("fresh_tensor_rule::composite_Nf");
+    let rep = LibraryRep::new_dual("fresh_tensor_rule::composite_R")
+        .unwrap()
+        .new_rep(dimension);
+    let matrix = function!(
+        SPENSO_TAG.tensor_symbol("fresh_tensor_rule::composite_M"),
+        SPENSO_TAG.chain_in,
+        SPENSO_TAG.chain_out
+    );
+    let chain = Tensor::infer(SPENSO_TAG.chain(
+        oriented_slot(rep, 241),
+        oriented_slot(rep.dual(), 243),
+        [&matrix],
+    ))
+    .unwrap();
+    let trace = Tensor::infer(spenso::shadowing::trace(rep.to_symbolic([]), [&matrix])).unwrap();
+    let scalar = leaf("fresh_tensor_rule::composite_scalar", &[]);
+    let word_head = symbol!("fresh_tensor_rule::composite_word"; Flat, Linear, Antisymmetric; tag=&SPENSO_TAG.tensor_word);
+    let word = Tensor::word(word_head, std::slice::from_ref(&scalar)).unwrap();
+    let norm = oriented_pair("fresh_tensor_rule::composite_power", rep, 247);
+    let power = norm.pow(&Tensor::infer(Atom::num(2)).unwrap()).unwrap();
+    let source_leaf = leaf("fresh_tensor_rule::composite_F", &[oriented_slot(rep, 245)]);
+    let rhs = leaf("fresh_tensor_rule::composite_G", &[oriented_slot(rep, 245)]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    for (composite, hidden) in [
+        (chain, matrix.clone()),
+        (trace, matrix),
+        (word, scalar.expression),
+        (power, norm.expression),
+    ] {
+        let seen = Arc::clone(&calls);
+        let opaque_rule = TensorRule::new(
+            Pattern::Literal(hidden.clone()),
+            ReplaceWith::Map(Box::new(move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Atom::Zero
+            })),
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(composite.expression.contains(hidden.as_view()));
+        assert!(
+            composite
+                .replace_rules_with_fresh_bindings(std::slice::from_ref(&opaque_rule))
+                .unwrap()
+                .same_value(&composite)
+        );
+        let source = Tensor::infer(&source_leaf.expression * &composite.expression).unwrap();
+        let actual = source
+            .replace_rules_with_fresh_bindings(&[
+                opaque_rule,
+                literal_rule(&source_leaf, rhs.expression.clone()),
+            ])
+            .unwrap();
+        let expected = Tensor::from_declared_parts(
+            &rhs.expression * &composite.expression,
+            source.structure.clone(),
+        )
+        .unwrap();
+        assert!(actual.same_value(&expected));
+        assert!(actual.expression.contains(composite.expression.as_view()));
+        assert_eq!(
+            actual.structure.logical_slots(),
+            source.structure.logical_slots()
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "composite payloads are not replacement occurrences"
+    );
 }

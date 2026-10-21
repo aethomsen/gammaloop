@@ -217,9 +217,16 @@ impl SymbolicTensor<PartialStructure> {
     /// caller's contract, not a physical parity or whole-action certificate.
     /// Use [`Self::map_word_generators`] for explicitly marked odd values.
     ///
-    /// The source retains the certified domain of [`Self::replace_rules`]:
-    /// ordinary explicit tensor leaves require self-dual ports. Nonzero
-    /// unresolved or uncertified sources and user normalizers are unsupported.
+    /// The source must have a checked interface, explicit ports and intrinsic
+    /// normalization; non-self-dual representations are supported. Each changed
+    /// RHS and the final result are checked against the original ordered ports,
+    /// including their representation, dimension, variance and index labels.
+    /// Unlike [`Self::replace_rules`], this does not require or establish the
+    /// stronger general leaf-rewrite certificate. Valid powers and composite
+    /// word/chain/trace subtrees remain opaque, including when their siblings
+    /// change; an unchanged subtree does not mean its contents were replaced.
+    /// Nonzero unresolved ports and user normalizers remain unsupported.
+    /// Native port compatibility is not a physical charge or covariance proof.
     /// Changed RHS values must have intrinsic normalization and checked ports.
     /// A validated zero returns unchanged without callbacks, preserving rank
     /// and logical order. Caller callbacks can allocate while constructing raw
@@ -229,9 +236,9 @@ impl SymbolicTensor<PartialStructure> {
         if rules.is_empty() || self.is_zero() {
             return Ok(self.clone());
         }
-        if !self.rewrites_preserve_interface() {
+        if !self.structure.open_positions().is_empty() || !self.normalization_is_intrinsic() {
             return Err(TensorInferenceError::invalid(
-                "fresh tensor replacement requires normalized intrinsic leaves with explicit ports and supported powers",
+                "fresh tensor replacement requires a checked intrinsic source with explicit ports",
             ));
         }
         let mut replacement = TensorReplacement {
